@@ -1,0 +1,52 @@
+# Fast feedback CI — runs on every push and PR.
+#
+# Two jobs: a no-llama lint+test that runs in seconds (catches normal Rust
+# regressions cheaply) and a full nix build that exercises the package
+# definition + the llama feature compile path.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: cargo test (no llama)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy (workspace, no llama)
+        run: cargo clippy --workspace --no-default-features --all-targets -- -D warnings
+
+      - name: test (tux-core, no llama)
+        run: cargo test --no-default-features -p tux-core --lib
+
+  nix:
+    name: nix build .#tux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: nix flake check (skips package eval errors early)
+        run: nix flake check --no-build
+      - name: build the tux package
+        run: nix build .#tux --print-build-logs
+      - name: smoke test the wrapped binary
+        run: ./result/bin/tux --version

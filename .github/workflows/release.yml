@@ -1,0 +1,129 @@
+# Tag-driven release workflow. Builds release binaries for Linux x86_64,
+# macOS Intel, and macOS Apple Silicon; tarballs each into the release
+# attachments; and builds + publishes a multi-arch container to ghcr.io.
+#
+# To cut a release:  git tag v0.2.0 && git push --tags
+#
+# UNTESTED end-to-end — first tag push will surface anything CI didn't
+# catch (notably libclang location on macOS for bindgen).
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # let maintainers re-run by hand if a build flakes
+
+permissions:
+  contents: write   # create the GitHub Release + attach assets
+  packages: write   # push the container to ghcr.io
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: tux-x86_64-linux.tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: tux-x86_64-macos.tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: tux-aarch64-macos.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Build deps for llama-cpp-sys-2.
+      - name: install build deps (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libclang-dev pkg-config
+          echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> "$GITHUB_ENV"
+
+      - name: install build deps (macos)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake llvm
+          # `brew --prefix llvm` resolves to the arch-correct path
+          # (/opt/homebrew on arm64, /usr/local on intel).
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
+      - name: build
+        run: cargo build --release -p tux-cli --target ${{ matrix.target }}
+
+      - name: package
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/${{ matrix.artifact }}" tux
+          (cd dist && shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}*
+
+  publish:
+    name: publish github release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: list collected artifacts
+        run: ls -la dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  container:
+    name: build & push container
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/tux
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          # llama.cpp builds are heavy on QEMU-emulated arm64; start with
+          # amd64 only and add linux/arm64 once we have a real arm runner.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

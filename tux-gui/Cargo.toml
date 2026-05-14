@@ -1,0 +1,26 @@
+[package]
+name = "tux-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "tux GTK4 GUI"
+
+[[bin]]
+name = "tux-gui"
+path = "src/main.rs"
+
+[features]
+default = ["llama"]
+llama = ["tux-core/llama"]
+vulkan = ["llama", "tux-core/vulkan"]
+
+[dependencies]
+tux-core = { path = "../tux-core" }
+anyhow = { workspace = true }
+directories = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+gtk4 = { version = "0.9", package = "gtk4" }
+glib = "0.20"

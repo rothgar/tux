@@ -1,0 +1,33 @@
+[package]
+name = "tux-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "tux command-line interface"
+
+[[bin]]
+name = "tux"
+path = "src/main.rs"
+
+[features]
+default = ["llama"]
+llama = ["tux-core/llama"]
+# Vulkan acceleration via llama.cpp's Vulkan backend (works on most iGPUs).
+# Build with: `cargo build --features vulkan`
+vulkan = ["llama", "tux-core/vulkan"]
+# Build without llama (mock backend only) for fast iteration outside the
+# nix dev shell: `cargo build --no-default-features`.
+
+[dependencies]
+tux-core = { path = "../tux-core" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+directories = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+futures-util = { version = "0.3", default-features = false }
