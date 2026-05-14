@@ -5,10 +5,7 @@ Pick whichever delivery you prefer. All paths give you the same `tux` CLI.
 ## Nix (recommended on NixOS / nix-darwin)
 
 ```sh
-# one-shot run, no install
-nix run github:rothgar/tux -- "install neovim"
-
-# or install into your profile
+# install into your profile
 nix profile install github:rothgar/tux
 ```
 
@@ -21,6 +18,50 @@ nix build .#tux
 
 The Nix package wraps `tux` so it can find `grim`, `scrot`, `wl-paste`,
 `xclip`, and `fd` even on minimal systems.
+
+### Home-Manager
+
+If you manage your user environment with [home-manager](https://github.com/nix-community/home-manager),
+add `tux` as a flake input and install the package + a user systemd
+unit for the daemon:
+
+```nix
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url      = "github:NixOS/nixpkgs/nixos-unstable";
+    home-manager.url = "github:nix-community/home-manager";
+    tux = {
+      url = "github:rothgar/tux";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs = { self, nixpkgs, home-manager, tux, ... }: {
+    homeConfigurations."me" = home-manager.lib.homeManagerConfiguration {
+      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      modules = [
+        ({ pkgs, ... }: {
+          home.packages = [ tux.packages.x86_64-linux.tux ];
+
+          # Run `tuxd` as a user service so the model stays loaded.
+          systemd.user.services.tuxd = {
+            Unit.Description = "tux local AI assistant daemon";
+            Service = {
+              ExecStart = "${tux.packages.x86_64-linux.tux}/bin/tux daemon serve";
+              Restart   = "on-failure";
+            };
+            Install.WantedBy = [ "default.target" ];
+          };
+        })
+      ];
+    };
+  };
+}
+```
+
+After switching, run `tux init` once to download a model, then
+`systemctl --user start tuxd.service`.
 
 ## Homebrew (macOS, Linuxbrew)
 
@@ -52,13 +93,52 @@ docker pull ghcr.io/rothgar/tux:latest
 # answer a single prompt; stdin → tux → stdout
 echo "what does systemd-analyze show?" \
   | docker run --rm -i -v tux-data:/data ghcr.io/rothgar/tux:latest
+```
 
-# run the daemon (mount XDG_RUNTIME_DIR in to share its socket)
+### Running the daemon as a container
+
+The daemon needs two host paths:
+
+1. **The model directory** — keeps multi-GB GGUF files on the host so
+   container rebuilds don't trigger a re-download. The image expects
+   `XDG_DATA_HOME=/data`, so models live at `/data/tux/models/` inside.
+2. **The unix socket directory** — `tuxd` binds
+   `$XDG_RUNTIME_DIR/tux.sock`; the host CLI reads the same path to
+   talk to it.
+
+Download a model on the host first (so you don't need to bind a TTY
+into the daemon container):
+
+```sh
+# one-shot init using a host-mounted model dir
+mkdir -p ~/.local/share/tux
+docker run --rm -it \
+  -v "$HOME/.local/share/tux:/data/tux" \
+  ghcr.io/rothgar/tux:latest init
+```
+
+Then start the long-running daemon, sharing both the model dir and the
+runtime socket dir:
+
+```sh
 docker run -d --name tuxd \
-  -v tux-data:/data \
-  -v "$XDG_RUNTIME_DIR:/run/user/1000" \
+  --user "$(id -u):$(id -g)" \
+  -v "$HOME/.local/share/tux:/data/tux" \
+  -v "$XDG_RUNTIME_DIR:$XDG_RUNTIME_DIR" \
+  -e XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
   ghcr.io/rothgar/tux:latest daemon serve
 ```
+
+With those mounts in place, a host-side `tux "..."` will auto-detect
+`$XDG_RUNTIME_DIR/tux.sock` and route through the containerized daemon.
+Verify with:
+
+```sh
+tux daemon status
+```
+
+For Podman, the same flags work — drop `--user` if you're running
+rootless (UIDs already match the host).
 
 ## Build from source
 
