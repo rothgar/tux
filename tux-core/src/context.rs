@@ -128,6 +128,42 @@ where
     out
 }
 
+/// Count distinct physical CPU cores, capped at 32.
+///
+/// Reads `/proc/cpuinfo` to count (physical_id, core_id) pairs; falls back
+/// to half of `available_parallelism` (typical SMT layout) and finally to 1.
+pub fn physical_cores() -> u32 {
+    fn from_proc() -> Option<u32> {
+        let data = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+        let mut pairs = std::collections::HashSet::new();
+        let mut phys: Option<String> = None;
+        let mut core: Option<String> = None;
+        for line in data.lines() {
+            if line.is_empty() {
+                if let (Some(p), Some(c)) = (phys.take(), core.take()) {
+                    pairs.insert((p, c));
+                }
+            } else if let Some((k, v)) = line.split_once(':') {
+                match k.trim() {
+                    "physical id" => phys = Some(v.trim().to_string()),
+                    "core id" => core = Some(v.trim().to_string()),
+                    _ => {}
+                }
+            }
+        }
+        if let (Some(p), Some(c)) = (phys, core) {
+            pairs.insert((p, c));
+        }
+        (!pairs.is_empty()).then(|| pairs.len() as u32)
+    }
+    let n = from_proc().unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| ((n.get() / 2).max(1)) as u32)
+            .unwrap_or(1)
+    });
+    n.clamp(1, 32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
