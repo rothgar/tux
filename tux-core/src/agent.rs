@@ -7,10 +7,42 @@
 
 use crate::backend::{Backend, ChatMessage, CompletionRequest, Role};
 use crate::context::SystemContext;
+use crate::tools::confirm::{with_confirmer, Confirmer, TtyConfirmer};
 use crate::tools::{ToolRegistry, ToolResult};
 use std::sync::Arc;
 
 const MAX_TOOL_HOPS: usize = 3;
+
+/// Persistent chat history for a single user session.
+///
+/// Owned by callers (the daemon keeps a single global one; in-process
+/// CLI users get a fresh one per invocation). Holds the system prompt
+/// (added lazily on the first turn so it can pick up the agent's
+/// fully-rendered prompt) plus every user / assistant / tool message
+/// the agent has produced. Reuse is what makes the daemon faster than
+/// loading a model per request.
+#[derive(Default)]
+pub struct Conversation {
+    messages: Vec<ChatMessage>,
+}
+
+impl Conversation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        self.messages.clear();
+    }
+
+    pub fn messages(&self) -> &[ChatMessage] {
+        &self.messages
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+}
 
 pub struct Agent {
     backend: Arc<dyn Backend>,
@@ -49,23 +81,53 @@ impl Agent {
     }
 
     /// Handle one user turn end-to-end, including tool invocation hops.
+    /// Single-shot convenience wrapper used by tests and the in-process
+    /// CLI path: spins up a fresh [`Conversation`] every call so there
+    /// is no cross-turn state. Uses a [`TtyConfirmer`] so destructive
+    /// tool calls still ask the human (and decline if no tty exists).
     pub async fn handle(&self, input: &str) -> anyhow::Result<AgentReply> {
-        let mut messages = vec![
-            ChatMessage {
+        let mut conv = Conversation::new();
+        self.turn(&mut conv, input, Arc::new(TtyConfirmer)).await
+    }
+
+    /// Handle one user turn against a persistent [`Conversation`].
+    /// Appends the new user message (and the system prompt the very
+    /// first time), runs the model + tool-dispatch loop, and pushes
+    /// every assistant / tool message back onto the conversation so the
+    /// next call reuses them. The `confirmer` is installed as a
+    /// task-local for the lifetime of this turn so any tool that asks
+    /// for confirmation routes through the right channel (tty for the
+    /// CLI, socket forwarding for the daemon).
+    pub async fn turn(
+        &self,
+        conv: &mut Conversation,
+        input: &str,
+        confirmer: Arc<dyn Confirmer>,
+    ) -> anyhow::Result<AgentReply> {
+        with_confirmer(confirmer, self.turn_inner(conv, input)).await
+    }
+
+    async fn turn_inner(
+        &self,
+        conv: &mut Conversation,
+        input: &str,
+    ) -> anyhow::Result<AgentReply> {
+        if conv.messages.is_empty() {
+            conv.messages.push(ChatMessage {
                 role: Role::System,
                 content: self.system_prompt(),
-            },
-            ChatMessage {
-                role: Role::User,
-                content: input.trim().to_string(),
-            },
-        ];
+            });
+        }
+        conv.messages.push(ChatMessage {
+            role: Role::User,
+            content: input.trim().to_string(),
+        });
 
         let mut tool_calls = Vec::new();
         let mut pending_images: Vec<std::path::PathBuf> = Vec::new();
 
         for _hop in 0..MAX_TOOL_HOPS {
-            let req = CompletionRequest::new(messages.clone())
+            let req = CompletionRequest::new(conv.messages.clone())
                 .with_images(std::mem::take(&mut pending_images));
             let resp = self.backend.complete(req).await?;
             let text = resp.text.trim().to_string();
@@ -86,11 +148,11 @@ impl Agent {
                         pending_images.push(p);
                     }
 
-                    messages.push(ChatMessage {
+                    conv.messages.push(ChatMessage {
                         role: Role::Assistant,
                         content: text,
                     });
-                    messages.push(ChatMessage {
+                    conv.messages.push(ChatMessage {
                         role: Role::Tool,
                         content: serde_json::to_string(&serde_json::json!({
                             "tool": result.tool,
@@ -103,12 +165,20 @@ impl Agent {
                     continue;
                 }
                 None => {
+                    conv.messages.push(ChatMessage {
+                        role: Role::Assistant,
+                        content: text.clone(),
+                    });
                     return Ok(AgentReply { text, tool_calls });
                 }
             }
         }
 
-        // Hit the hop cap — return what we have with a note.
+        // Hit the hop cap — return what we have with a note. The
+        // assistant turn that exhausted the budget already lives in
+        // `conv.messages` as the final tool's predecessor; we don't add
+        // an extra synthetic assistant message because the model didn't
+        // actually produce one.
         Ok(AgentReply {
             text: "(reached tool-call limit without a final answer)".into(),
             tool_calls,
@@ -125,6 +195,14 @@ impl Agent {
             "You are tux, a helpful local assistant on a Linux machine. \
 Answer naturally in plain prose. Be concise. When you suggest commands, \
 prefer ones appropriate for the host described below.
+
+When the user refers to \"your\" / \"yourself\" / \"your config\" / \
+\"your knowledge\" / \"your <field>\" (e.g. \"your update_cmd\", \"your \
+install command\"), they mean YOUR OWN persisted configuration — the \
+fields shown in the \"Package management & system commands\" block below, \
+which are stored at $XDG_DATA_HOME/tux/system.json. To change one of \
+those, call the `set_knowledge` tool. Do NOT refuse with \"I don't have \
+access to my internal variables\" — you do, via that tool.
 
 When you need to use a tool, output ONLY the tool call on a single line \
 with no other text, in this exact format:

@@ -8,25 +8,27 @@
 //!    so we restrict it to a strict charset to keep a chatty model from
 //!    smuggling in `; rm -rf` or backticks.
 //!
-//! 2. **Confirmation read from /dev/tty.** Stdin may be a pipe (`echo
-//!    "install foo" | tux`), so a raw `read_line` on stdin would either
-//!    consume the prompt body or fail outright. Opening `/dev/tty`
-//!    directly always talks to the controlling terminal when one exists.
-//!    Headless / non-interactive runs (no controlling tty) refuse to
-//!    install — explicit policy: never silently change system state.
+//! 2. **Confirmation via the active [`Confirmer`].** In the in-process
+//!    CLI path that's [`TtyConfirmer`] (opens `/dev/tty` directly so
+//!    `echo ... | tux` still asks the human). In the daemon path the
+//!    agent installs a [`ChannelConfirmer`] that ferries the question
+//!    back over the unix socket. Either way, "no human present" still
+//!    declines — explicit policy: never silently change system state.
+//!
+//! [`Confirmer`]: super::confirm::Confirmer
+//! [`TtyConfirmer`]: super::confirm::TtyConfirmer
+//! [`ChannelConfirmer`]: super::confirm::ChannelConfirmer
 //!
 //! Escalation: if the template starts with `sudo ` and `pkexec` is on
 //! `PATH`, we swap in `pkexec` for a GUI auth prompt (better UX from a
 //! desktop assistant). Otherwise we run the template as-is, which falls
 //! back to the user's terminal `sudo` prompt.
 
+use super::confirm::confirm;
 use super::{Tool, ToolResult};
 use crate::context::SystemContext;
 use async_trait::async_trait;
 use serde_json::json;
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
 use tokio::process::Command;
 
 #[derive(Default)]
@@ -61,28 +63,6 @@ fn pkexec_on_path() -> bool {
         return false;
     };
     std::env::split_paths(&path).any(|d| d.join("pkexec").is_file())
-}
-
-/// Prompt on `/dev/tty` and read a single line response. Returns `Ok(false)`
-/// (decline) if there's no controlling tty — we treat "no human present"
-/// as "do not proceed".
-fn confirm_via_tty(prompt: &str) -> anyhow::Result<bool> {
-    let tty_path = PathBuf::from("/dev/tty");
-    let mut writer = match OpenOptions::new().read(true).write(true).open(&tty_path) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!("no /dev/tty for confirmation ({e}); declining install");
-            return Ok(false);
-        }
-    };
-    write!(writer, "{prompt}")?;
-    writer.flush()?;
-    let reader_handle = writer.try_clone()?;
-    let mut reader = BufReader::new(reader_handle);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    let ans = line.trim().to_ascii_lowercase();
-    Ok(matches!(ans.as_str(), "y" | "yes"))
 }
 
 #[async_trait]
@@ -120,7 +100,7 @@ impl Tool for InstallPackageTool {
             render_command(&knowledge.install_cmd, pkg, pkexec_on_path());
 
         let prompt = format!("tux: install `{pkg}` with: {command}\nproceed? [y/N]: ");
-        if !confirm_via_tty(&prompt)? {
+        if !confirm(&prompt).await? {
             return Ok(ToolResult {
                 tool: "install_package".into(),
                 summary: format!("install of `{pkg}` cancelled"),

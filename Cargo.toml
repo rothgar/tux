@@ -6,7 +6,7 @@ members = ["tux-core", "tux-cli", "tux-gui"]
 default-members = ["tux-core", "tux-cli"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/rothgar/tux"
@@ -23,3 +23,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 directories = "5"
 chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"

@@ -172,8 +172,90 @@ pub fn save(knowledge: &DistroKnowledge) -> anyhow::Result<PathBuf> {
         fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(knowledge)?;
-    fs::write(&path, json)?;
+    // Atomic write so a crash mid-write can't truncate system.json.
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json)?;
+    fs::rename(&tmp, &path)?;
     Ok(path)
+}
+
+/// Return the path where `system.json` lives, even if it doesn't exist yet.
+pub fn config_path() -> Option<PathBuf> {
+    cache_path()
+}
+
+/// Update one field of the persisted knowledge and write it back. Loads
+/// the current value via [`for_distro`] (which prefers the on-disk cache
+/// and falls back to the static table for `distro_id`), mutates the
+/// requested field, and atomically saves.
+///
+/// `value` is a JSON value: string for scalar fields, array of strings
+/// for `config_paths` / `notes`. A bare string is also accepted for the
+/// list fields and treated as a one-element list.
+pub fn update_field(
+    distro_id: Option<&str>,
+    field: &str,
+    value: &serde_json::Value,
+) -> anyhow::Result<(PathBuf, DistroKnowledge)> {
+    let mut k = match distro_id.and_then(for_distro) {
+        Some(k) => k,
+        None => {
+            // No prior knowledge and no recognized distro — start from a
+            // blank-ish template the user can refine.
+            DistroKnowledge {
+                package_manager: String::new(),
+                install_cmd: String::new(),
+                remove_cmd: String::new(),
+                search_cmd: String::new(),
+                update_cmd: String::new(),
+                escalation: "sudo".into(),
+                service_manager: "systemctl".into(),
+                config_paths: vec![],
+                notes: vec![],
+            }
+        }
+    };
+
+    fn as_string(v: &serde_json::Value, field: &str) -> anyhow::Result<String> {
+        v.as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("field {field} expects a string value"))
+    }
+    fn as_string_vec(v: &serde_json::Value, field: &str) -> anyhow::Result<Vec<String>> {
+        if let Some(s) = v.as_str() {
+            return Ok(vec![s.to_string()]);
+        }
+        let arr = v
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("field {field} expects a string or array of strings"))?;
+        arr.iter()
+            .map(|e| {
+                e.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow::anyhow!("field {field} contains a non-string element"))
+            })
+            .collect()
+    }
+
+    match field {
+        "package_manager" => k.package_manager = as_string(value, field)?,
+        "install_cmd" => k.install_cmd = as_string(value, field)?,
+        "remove_cmd" => k.remove_cmd = as_string(value, field)?,
+        "search_cmd" => k.search_cmd = as_string(value, field)?,
+        "update_cmd" => k.update_cmd = as_string(value, field)?,
+        "escalation" => k.escalation = as_string(value, field)?,
+        "service_manager" => k.service_manager = as_string(value, field)?,
+        "config_paths" => k.config_paths = as_string_vec(value, field)?,
+        "notes" => k.notes = as_string_vec(value, field)?,
+        other => anyhow::bail!(
+            "unknown knowledge field: {other} (valid: package_manager, install_cmd, \
+             remove_cmd, search_cmd, update_cmd, escalation, service_manager, \
+             config_paths, notes)"
+        ),
+    }
+
+    let path = save(&k)?;
+    Ok((path, k))
 }
 
 #[cfg(test)]

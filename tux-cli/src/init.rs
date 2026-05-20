@@ -10,6 +10,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
+use tux_core::config::{BackendConfig, BackendType, InferenceConfig, TuxConfig};
+use tux_core::context::physical_cores;
 use tux_core::models::{self, ModelEntry, ModelKind};
 use tux_core::{knowledge, SystemContext};
 
@@ -44,16 +46,143 @@ fn models_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Best-effort GPU VRAM in MiB.
+///
+/// Tries NVIDIA first via `nvidia-smi`, then AMD/Intel via sysfs.
+/// Returns 0 when no GPU is detected or VRAM cannot be read.
+fn detect_gpu_vram_mib() -> u64 {
+    // NVIDIA
+    if let Ok(out) = Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            // nvidia-smi may list multiple GPUs; sum them
+            let total: u64 = s
+                .lines()
+                .filter_map(|l| l.trim().parse::<u64>().ok())
+                .sum();
+            if total > 0 {
+                return total;
+            }
+        }
+    }
+    // AMD / Intel via sysfs (`mem_info_vram_total` is in bytes)
+    if let Ok(entries) = fs::read_dir("/sys/class/drm") {
+        for entry in entries.flatten() {
+            let vram_path = entry.path().join("device/mem_info_vram_total");
+            if let Ok(s) = fs::read_to_string(&vram_path) {
+                if let Ok(bytes) = s.trim().parse::<u64>() {
+                    if bytes > 0 {
+                        return bytes / 1024 / 1024;
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Compute hardware-tuned `InferenceConfig` and write it alongside the
+/// backend config to `~/.config/tux/config.toml`.
+fn write_config(
+    model_path: &PathBuf,
+    mmproj_path: Option<&PathBuf>,
+    model_size_mib: u32,
+    ram_mib: u32,
+    vram_mib: u64,
+) -> Result<()> {
+    let n_threads = physical_cores();
+
+    let ctx_size = match ram_mib {
+        0..=8191 => 2048,
+        8192..=16383 => 4096,
+        _ => 8192,
+    };
+
+    // Full GPU offload if VRAM fits model + 512 MiB headroom for KV cache.
+    // 99 is the llama.cpp convention for "all layers"; it is clamped to
+    // the actual layer count at load time.
+    let n_gpu_layers = if vram_mib >= model_size_mib as u64 + 512 {
+        99
+    } else {
+        0
+    };
+
+    let cfg = TuxConfig {
+        backend: BackendConfig {
+            kind: BackendType::Local,
+            model_path: Some(model_path.clone()),
+            mmproj_path: mmproj_path.cloned(),
+            ..Default::default()
+        },
+        inference: InferenceConfig {
+            n_threads,
+            ctx_size,
+            n_gpu_layers,
+            batch_size: 512,
+        },
+    };
+
+    let path = cfg.save()?;
+
+    eprintln!(
+        "wrote config → {} (threads={n_threads}, ctx={ctx_size}, gpu_layers={n_gpu_layers})",
+        path.display()
+    );
+    Ok(())
+}
+
 pub struct InitOptions {
     pub model: Option<String>,
     pub install_daemon: bool,
     pub with_vision: bool,
+    /// If set, skip GGUF download and write a remote backend config instead.
+    pub remote_url: Option<String>,
+    pub remote_model: Option<String>,
 }
 
 pub async fn run(opts: InitOptions) -> Result<()> {
     let ram = total_ram_mib();
     let cores = cpu_cores();
-    eprintln!("detected: {cores} cores, {} MiB RAM", ram);
+    let vram = detect_gpu_vram_mib();
+
+    eprintln!(
+        "detected: {cores} cores ({} physical), {} MiB RAM{}",
+        physical_cores(),
+        ram,
+        if vram > 0 {
+            format!(", {vram} MiB GPU VRAM")
+        } else {
+            ", no GPU detected".to_string()
+        }
+    );
+
+    // Remote-backend init: write config and stop — no GGUF needed.
+    if let Some(url) = opts.remote_url {
+        let model = opts
+            .remote_model
+            .unwrap_or_else(|| "default".to_string());
+        let cfg = TuxConfig {
+            backend: BackendConfig {
+                kind: BackendType::Remote,
+                url: Some(url.clone()),
+                model: Some(model.clone()),
+                ..Default::default()
+            },
+            inference: InferenceConfig::default(),
+        };
+        let path = cfg.save()?;
+        eprintln!("wrote config → {}", path.display());
+        eprintln!("remote backend: {url}  model: {model}");
+        persist_system_knowledge()?;
+        if opts.install_daemon {
+            install_daemon_unit()?;
+        }
+        eprintln!("\ndone. try: tux \"how do I check disk usage?\"");
+        return Ok(());
+    }
 
     let entry = match opts.model.as_deref() {
         Some(id) => models::lookup(id)
@@ -79,9 +208,13 @@ pub async fn run(opts: InitOptions) -> Result<()> {
     #[cfg(feature = "llama")]
     {
         eprintln!("validating model loads…");
-        let _ = tux_core::backend::llama::from_kind(&tux_core::backend::BackendKind::LlamaCpp {
+        let _ = tux_core::backend::from_kind(tux_core::backend::BackendKind::LlamaCpp {
             model_path: dest.clone(),
             mmproj_path: None,
+            n_threads: 0,
+            ctx_size: 4096,
+            n_gpu_layers: 0,
+            batch_size: 512,
         })
         .with_context(|| format!("model failed to load: {}", dest.display()))?;
         eprintln!("ok");
@@ -99,6 +232,16 @@ pub async fn run(opts: InitOptions) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("no default vision model in registry"))?;
         download_vision(v).await?;
     }
+
+    // Write hardware-tuned config.toml.
+    let mmproj = dir.join("default.mmproj");
+    write_config(
+        &dest,
+        mmproj.exists().then_some(&mmproj),
+        entry.size_mib,
+        ram,
+        vram,
+    )?;
 
     persist_system_knowledge()?;
 

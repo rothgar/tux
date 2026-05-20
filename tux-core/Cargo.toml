@@ -27,5 +27,8 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 directories = { workspace = true }
 
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+toml = { workspace = true }
+
 llama-cpp-2 = { version = "0.1.146", optional = true, features = ["mtmd"] }
 encoding_rs = { version = "0.8", optional = true }
