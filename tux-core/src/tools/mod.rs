@@ -9,9 +9,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub mod clipboard;
+pub mod confirm;
 pub mod files;
 pub mod install;
+pub mod knowledge;
 pub mod screenshot;
+
+pub use confirm::{ChannelConfirmer, Confirmer, TtyConfirmer};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -48,6 +52,7 @@ impl ToolRegistry {
         r.register(Arc::new(files::ReadFileTool::default()));
         r.register(Arc::new(files::EditFileTool::default()));
         r.register(Arc::new(files::WriteFileTool::default()));
+        r.register(Arc::new(knowledge::SetKnowledgeTool::default()));
         r
     }
 

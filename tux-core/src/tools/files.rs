@@ -20,11 +20,10 @@
 //! shell, and a path allow-list is brittle (every distro lays files
 //! out differently). The /dev/tty confirmation is the safety net.
 
+use super::confirm::confirm;
 use super::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -67,29 +66,6 @@ fn on_path(bin: &str) -> bool {
         return false;
     };
     std::env::split_paths(&path).any(|d| d.join(bin).is_file())
-}
-
-/// Prompt on `/dev/tty` and read a yes/no. Returns `Ok(false)` if there
-/// is no controlling tty (we treat "no human present" as "do not edit").
-fn confirm_via_tty(prompt: &str) -> anyhow::Result<bool> {
-    let mut writer = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-    {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!("no /dev/tty for confirmation ({e}); declining edit");
-            return Ok(false);
-        }
-    };
-    write!(writer, "{prompt}")?;
-    writer.flush()?;
-    let reader = writer.try_clone()?;
-    let mut buf = String::new();
-    BufReader::new(reader).read_line(&mut buf)?;
-    let ans = buf.trim().to_ascii_lowercase();
-    Ok(matches!(ans.as_str(), "y" | "yes"))
 }
 
 /// Truncate a snippet for display in a confirmation prompt. Multi-line
@@ -340,7 +316,7 @@ impl Tool for EditFileTool {
             snippet(old, 60),
             snippet(new, 60),
         );
-        if !confirm_via_tty(&prompt)? {
+        if !confirm(&prompt).await? {
             return Ok(ToolResult {
                 tool: "edit_file".into(),
                 summary: format!("edit of {} cancelled", path.display()),
@@ -422,7 +398,7 @@ impl Tool for WriteFileTool {
             path.display(),
             content.len(),
         );
-        if !confirm_via_tty(&prompt)? {
+        if !confirm(&prompt).await? {
             return Ok(ToolResult {
                 tool: "write_file".into(),
                 summary: format!("write of {} cancelled", path.display()),
